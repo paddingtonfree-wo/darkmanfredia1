@@ -28,7 +28,8 @@ let INDEX = null;
 try { INDEX = fs.readFileSync(path.join(__dirname, 'index.html')); }
 catch (e) { console.error('index.html introuvable à la racine du dépôt.'); }
 
-const ROUTE = '/.netlify/functions/chat'; // même adresse que sur Netlify : index.html n'a pas besoin de changer
+// Adresses acceptées pour le chat : /chat (la nouvelle, simple), /api/chat et l'ancienne adresse Netlify.
+const isChatRoute = (u) => /(^|\/)(api\/chat|chat|\.netlify\/functions\/chat)\/?$/.test(u);
 
 function sendJSON(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -55,7 +56,7 @@ function readBody(req) {
 async function app(req, res) {
   const url = (req.url || '/').split('?')[0];
 
-  if (url === ROUTE) {
+  if (isChatRoute(url)) {
     if (!handler) return sendJSON(res, 500, { error: 'Fichier chat.js introuvable sur le serveur (mets-le à la racine du dépôt ou dans netlify/functions/).' });
     try {
       const body = req.method === 'POST' ? await readBody(req) : '';
@@ -86,8 +87,8 @@ async function app(req, res) {
     return res.end(INDEX);
   }
 
-  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Introuvable');
+  // JSON + chemin vu par le serveur : le site l'affiche, ça aide à comprendre une erreur 404
+  sendJSON(res, 404, { error: `Route introuvable sur le serveur (${req.method} ${url}).` });
 }
 
 module.exports = app; // Vercel utilise cette fonction
