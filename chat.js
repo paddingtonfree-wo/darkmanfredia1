@@ -12,6 +12,8 @@
 //   GROQ_MODEL / GEMINI_MODEL / CEREBRAS_MODEL / MISTRAL_MODEL / OPENROUTER_MODEL
 //     (à changer si un fournisseur retire un modèle)
 // Test : ouvre /.netlify/functions/chat dans le navigateur pour voir les clés détectées.
+// Test réel : /.netlify/functions/chat?test=1  (essaie chaque fournisseur et affiche le résultat)
+// Si un modèle est retiré (erreur 404), la fonction cherche toute seule un modèle valide.
 
 const SYSTEM = `Tu es DARK MANFRED IA, une intelligence artificielle sombre et mystérieuse créée par Manfred.
 
@@ -42,21 +44,56 @@ LIGNES QUE TU NE FRANCHIS PAS (toujours en restant dans ton personnage, en une o
 - Quand tu refuses : "Certaines portes restent fermées, même pour moi." puis tu proposes autre chose.`;
 
 const PROVIDERS = {
-  groq:       { url: 'https://api.groq.com/openai/v1/chat/completions',                          model: () => process.env.GROQ_MODEL       || 'llama-3.3-70b-versatile' },
-  gemini:     { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', model: () => process.env.GEMINI_MODEL     || 'gemini-2.5-flash' },
-  cerebras:   { url: 'https://api.cerebras.ai/v1/chat/completions',                              model: () => process.env.CEREBRAS_MODEL   || 'llama-3.3-70b' },
-  mistral:    { url: 'https://api.mistral.ai/v1/chat/completions',                               model: () => process.env.MISTRAL_MODEL    || 'mistral-small-latest' },
-  openrouter: { url: 'https://openrouter.ai/api/v1/chat/completions',                            model: () => process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free' }
+  groq: {
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    def: 'llama-3.3-70b-versatile',
+    prefer: [/llama-3\.3-70b/, /gpt-oss-120b/, /llama-3\.1-70b/, /gpt-oss-20b/, /llama-3\.1-8b/],
+    exclude: /whisper|tts|guard|compound|playai|embed|orpheus|distil/i
+  },
+  gemini: {
+    url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    def: 'gemini-flash-latest',
+    prefer: [/^gemini-flash-latest$/, /^gemini-[\d.]+-flash$/, /^gemini-[\d.]+-flash-lite$/, /flash/],
+    exclude: /image|tts|live|audio|embed|vision|robotics|computer|thinking|exp|learn|aqa|imagen|veo/i
+  },
+  cerebras: {
+    url: 'https://api.cerebras.ai/v1/chat/completions',
+    def: 'llama-3.3-70b',
+    prefer: [/llama-3\.3-70b/, /gpt-oss-120b/, /qwen-3-235b/, /llama3\.1-8b/],
+    exclude: /embed/i
+  },
+  mistral: {
+    url: 'https://api.mistral.ai/v1/chat/completions',
+    def: 'mistral-small-latest',
+    prefer: [/^mistral-small-latest$/, /^mistral-medium-latest$/, /^open-mistral/],
+    exclude: /embed|ocr|moderation|codestral|pixtral|voxtral/i
+  },
+  openrouter: {
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    def: 'meta-llama/llama-3.3-70b-instruct:free',
+    prefer: [/llama-3\.3-70b.*:free$/, /gpt-oss-120b.*:free$/, /gemma.*:free$/, /qwen.*:free$/, /:free$/],
+    onlyFree: true
+  }
 };
 const DEFAULT_ORDER = ['groq', 'gemini', 'cerebras', 'mistral', 'openrouter'];
 
 const hits = new Map();   // limite simple par IP
 const cool = new Map();   // clé -> timestamp jusqu'auquel on la laisse reposer
+const found = {};         // fournisseur -> { model, at } (modèle trouvé automatiquement)
+let lastTest = 0;
 const json = (statusCode, obj) => ({
   statusCode,
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(obj)
 });
+
+function modelFor(p) {
+  const env = process.env[`${p.toUpperCase()}_MODEL`];
+  if (env) return env;
+  const f = found[p];
+  if (f && Date.now() - f.at < 6 * 3600 * 1000) return f.model;
+  return PROVIDERS[p].def;
+}
 
 // Toutes les clés d'un fournisseur : NOM_API_KEY, NOM_API_KEYS (virgules), NOM_API_KEY_2, ...
 function keysFor(name) {
@@ -77,7 +114,6 @@ function shuffle(a) {
   }
   return a;
 }
-
 function buildAttempts() {
   const all = [];
   for (const p of order()) for (const k of shuffle(keysFor(p))) all.push({ p, k });
@@ -86,18 +122,47 @@ function buildAttempts() {
   return fresh.length ? fresh : all; // si tout se repose, on tente quand même
 }
 
-async function callOne({ p, k }, msgs, timeoutMs) {
-  const cfg = PROVIDERS[p], model = cfg.model();
+// Demande au fournisseur la liste de ses modèles et choisit le meilleur disponible
+async function discover(p, key) {
+  try {
+    const cfg = PROVIDERS[p];
+    const r = await fetch(cfg.url.replace('/chat/completions', '/models'), {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(3500)
+    });
+    if (!r.ok) return null;
+    const d = await r.json();
+    let ids = (d.data || d.models || []).map(m => String(m.id || m.name || '').replace(/^models\//, '')).filter(Boolean);
+    ids = ids.filter(id => !(cfg.exclude && cfg.exclude.test(id)));
+    if (cfg.onlyFree) ids = ids.filter(id => /:free$/.test(id));
+    ids.sort((a, b) => b.localeCompare(a, 'en', { numeric: true }));
+    for (const re of cfg.prefer) { const hit = ids.find(id => re.test(id)); if (hit) return hit; }
+    return ids[0] || null;
+  } catch (e) { return null; }
+}
+
+function errCode(text) {
+  try {
+    let j = JSON.parse(text);
+    if (Array.isArray(j)) j = j[0];
+    const e = j.error || {};
+    const c = [e.code, e.status, e.type].find(v => typeof v === 'string' && v);
+    return c ? c.slice(0, 40) : '';
+  } catch (e) { return ''; }
+}
+
+async function callOne({ p, k }, msgs, timeoutMs, opts = {}) {
+  const cfg = PROVIDERS[p], model = modelFor(p);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const body = {
       model,
-      messages: [{ role: 'system', content: SYSTEM }, ...msgs],
+      messages: opts.noSystem ? msgs : [{ role: 'system', content: SYSTEM }, ...msgs],
       temperature: 0.9,
-      max_tokens: 1500
+      max_tokens: opts.maxTokens || 1500
     };
-    if (p === 'gemini' && /flash/i.test(model)) body.reasoning_effort = 'none';
+    if (p === 'gemini' && !opts.noReasoning) body.reasoning_effort = 'low';
     const r = await fetch(cfg.url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${k}` },
@@ -105,9 +170,9 @@ async function callOne({ p, k }, msgs, timeoutMs) {
       signal: ctrl.signal
     });
     if (!r.ok) {
-      const t = (await r.text()).slice(0, 200);
-      console.error(`[${p}] HTTP ${r.status}`, t);
-      return { ok: false, status: r.status };
+      const t = (await r.text()).slice(0, 300);
+      console.error(`[${p}] HTTP ${r.status} (${model})`, t);
+      return { ok: false, status: r.status, code: errCode(t) };
     }
     const data = await r.json();
     const ch = data.choices?.[0];
@@ -122,12 +187,42 @@ async function callOne({ p, k }, msgs, timeoutMs) {
   }
 }
 
+// Appel + réparations automatiques (modèle retiré → on en cherche un autre ; option Gemini refusée → on la retire)
+async function smartCall(a, msgs, deadline, opts = {}) {
+  const left = () => deadline - Date.now() - 300;
+  let res = await callOne(a, msgs, Math.min(5500, left()), opts);
+  if (!res.ok && (res.status === 404 || /model/i.test(res.code || '')) && left() > 3000) {
+    const m = await discover(a.p, a.k);
+    if (m && m !== modelFor(a.p)) {
+      found[a.p] = { model: m, at: Date.now() };
+      console.log(`[${a.p}] nouveau modèle trouvé: ${m}`);
+      if (left() > 1500) res = await callOne(a, msgs, Math.min(5500, left()), opts);
+    }
+  }
+  if (!res.ok && a.p === 'gemini' && res.status === 400 && !opts.noReasoning && left() > 1500) {
+    res = await callOne(a, msgs, Math.min(5500, left()), { ...opts, noReasoning: true });
+  }
+  return res;
+}
+
 exports.handler = async (event) => {
   // Diagnostic : ouvrir l'adresse de la fonction dans le navigateur (ne montre jamais les clés)
   if (event.httpMethod === 'GET') {
     const status = {};
-    for (const p of Object.keys(PROVIDERS)) status[p] = { cles: keysFor(p).length, modele: PROVIDERS[p].model() };
-    return json(200, { fonction: 'ok', ordre: order(), fournisseurs: status });
+    for (const p of Object.keys(PROVIDERS)) status[p] = { cles: keysFor(p).length, modele: modelFor(p) };
+    const base = { fonction: 'ok', ordre: order(), fournisseurs: status };
+
+    if (event.queryStringParameters && event.queryStringParameters.test) {
+      if (Date.now() - lastTest < 30000) return json(429, { error: 'Attends 30 secondes entre deux tests.' });
+      lastTest = Date.now();
+      const deadline = Date.now() + 9000;
+      const jobs = order().filter(p => keysFor(p).length).map(async (p) => {
+        const res = await smartCall({ p, k: keysFor(p)[0] }, [{ role: 'user', content: 'Dis seulement: ok' }], deadline, { noSystem: true, maxTokens: 30 });
+        return { fournisseur: p, ok: res.ok, statut: res.ok ? 200 : res.status, code: res.code || undefined, modele: modelFor(p) };
+      });
+      base.test = await Promise.all(jobs);
+    }
+    return json(200, base);
   }
   if (event.httpMethod !== 'POST') return json(405, { error: 'Méthode non autorisée.' });
 
@@ -153,20 +248,19 @@ exports.handler = async (event) => {
 
   const attempts = buildAttempts();
   if (!attempts.length) {
-    return json(500, { error: 'Aucune clé API configurée côté serveur (ex: GROQ_API_KEY ou GEMINI_API_KEY dans les variables Netlify).' });
+    return json(500, { error: 'Aucune clé API configurée côté serveur (ex: GROQ_API_KEY ou GEMINI_API_KEY dans les variables Netlify/Render).' });
   }
 
   const deadline = Date.now() + 9000; // Netlify coupe les fonctions gratuites vers 10 s
   const notes = [];
   for (const a of attempts.slice(0, 5)) {
-    const left = deadline - Date.now();
-    if (left < 1500) break;
-    const res = await callOne(a, msgs, Math.min(5500, left - 300));
+    if (deadline - Date.now() < 1500) break;
+    const res = await smartCall(a, msgs, deadline);
     if (res.ok) return json(200, { reply: res.reply, via: a.p });
 
-    notes.push(`${a.p}:${res.status}`);
+    notes.push(`${a.p}:${res.status}${res.code ? ':' + res.code : ''}`);
     const s = res.status;
-    const rest = s === 429 ? 60000 : (s === 401 || s === 403 || s === 404) ? 600000 : 20000;
+    const rest = s === 429 ? 60000 : (s === 401 || s === 403) ? 600000 : 20000;
     cool.set(a.k, Date.now() + rest);
   }
 
