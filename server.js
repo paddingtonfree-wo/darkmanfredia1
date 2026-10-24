@@ -29,7 +29,8 @@ const server = http.createServer((req, res) => {
     });
     req.on('end', async () => {
       try {
-        const out = await handler({ httpMethod: req.method, headers: req.headers, body });
+        const query = Object.fromEntries(new URL(req.url, 'http://localhost').searchParams);
+        const out = await handler({ httpMethod: req.method, headers: req.headers, body, queryStringParameters: query });
         res.writeHead(out.statusCode, out.headers || { 'Content-Type': 'application/json' });
         res.end(out.body);
       } catch (e) {
