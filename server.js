@@ -3,6 +3,10 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+// Sur Render, pas de limite de 10 s : on laisse plus de temps aux IA (modifiable dans les variables d'environnement)
+process.env.TIME_BUDGET_MS = process.env.TIME_BUDGET_MS || '25000';
+process.env.ATTEMPT_TIMEOUT_MS = process.env.ATTEMPT_TIMEOUT_MS || '15000';
+
 // chat.js peut être dans netlify/functions/ (Netlify) OU à la racine du dépôt (plus simple à envoyer depuis un téléphone)
 function loadHandler() {
   for (const p of ['./netlify/functions/chat.js', './chat.js']) {
