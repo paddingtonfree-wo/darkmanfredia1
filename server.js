@@ -3,7 +3,16 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { handler } = require('./netlify/functions/chat.js');
+// chat.js peut être dans netlify/functions/ (Netlify) OU à la racine du dépôt (plus simple à envoyer depuis un téléphone)
+function loadHandler() {
+  for (const p of ['./netlify/functions/chat.js', './chat.js']) {
+    try { return require(p).handler; }
+    catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
+  }
+  console.error('chat.js introuvable : mets-le dans netlify/functions/ ou à la racine du dépôt.');
+  process.exit(1);
+}
+const handler = loadHandler();
 
 const PORT = process.env.PORT || 10000;
 const ROUTE = '/.netlify/functions/chat'; // même adresse que sur Netlify : index.html n'a pas besoin de changer
