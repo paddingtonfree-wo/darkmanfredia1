@@ -47,7 +47,7 @@ const PROVIDERS = {
   groq: {
     url: 'https://api.groq.com/openai/v1/chat/completions',
     def: 'llama-3.3-70b-versatile',
-    prefer: [/llama-3\.3-70b/, /gpt-oss-120b/, /llama-3\.1-70b/, /gpt-oss-20b/, /llama-3\.1-8b/],
+    prefer: [/llama-3\.3-70b/, /llama-4-maverick/, /llama-4-scout/, /gpt-oss-120b/, /llama-3\.1-70b/, /gpt-oss-20b/, /llama-3\.1-8b/],
     exclude: /whisper|tts|guard|compound|playai|embed|orpheus|distil/i
   },
   gemini: {
@@ -76,6 +76,8 @@ const PROVIDERS = {
   }
 };
 const DEFAULT_ORDER = ['groq', 'gemini', 'cerebras', 'mistral', 'openrouter'];
+const BUDGET_MS = () => parseInt(process.env.TIME_BUDGET_MS || '9000', 10);      // temps total max par message
+const ATTEMPT_MS = () => parseInt(process.env.ATTEMPT_TIMEOUT_MS || '5500', 10); // temps max par essai
 
 const hits = new Map();   // limite simple par IP
 const cool = new Map();   // clé -> timestamp jusqu'auquel on la laisse reposer
@@ -151,7 +153,14 @@ function errCode(text) {
   } catch (e) { return ''; }
 }
 
-async function callOne({ p, k }, msgs, timeoutMs, opts = {}) {
+async function callOne(a, msgs, timeoutMs, opts = {}) {
+  const t0 = Date.now();
+  const res = await callOneRaw(a, msgs, timeoutMs, opts);
+  res.ms = Date.now() - t0;
+  return res;
+}
+
+async function callOneRaw({ p, k }, msgs, timeoutMs, opts = {}) {
   const cfg = PROVIDERS[p], model = modelFor(p);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -162,7 +171,9 @@ async function callOne({ p, k }, msgs, timeoutMs, opts = {}) {
       temperature: 0.9,
       max_tokens: opts.maxTokens || 1500
     };
-    if (p === 'gemini' && !opts.noReasoning) body.reasoning_effort = 'low';
+    if (!opts.noReasoning && (p === 'gemini' || (/gpt-oss/i.test(model) && (p === 'groq' || p === 'cerebras')))) {
+      body.reasoning_effort = 'low';
+    }
     const r = await fetch(cfg.url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${k}` },
@@ -177,7 +188,7 @@ async function callOne({ p, k }, msgs, timeoutMs, opts = {}) {
     const data = await r.json();
     const ch = data.choices?.[0];
     const reply = ch?.message?.content?.trim();
-    if (!reply || ch?.finish_reason === 'content_filter') return { ok: false, status: 'vide' };
+    if (!reply || ch?.finish_reason === 'content_filter') return { ok: false, status: 'vide', code: String(ch?.finish_reason || '') };
     return { ok: true, reply };
   } catch (e) {
     console.error(`[${p}]`, e.name === 'AbortError' ? 'timeout' : e.message);
@@ -190,17 +201,17 @@ async function callOne({ p, k }, msgs, timeoutMs, opts = {}) {
 // Appel + réparations automatiques (modèle retiré → on en cherche un autre ; option Gemini refusée → on la retire)
 async function smartCall(a, msgs, deadline, opts = {}) {
   const left = () => deadline - Date.now() - 300;
-  let res = await callOne(a, msgs, Math.min(5500, left()), opts);
+  let res = await callOne(a, msgs, Math.min(ATTEMPT_MS(), left()), opts);
   if (!res.ok && (res.status === 404 || /model/i.test(res.code || '')) && left() > 3000) {
     const m = await discover(a.p, a.k);
     if (m && m !== modelFor(a.p)) {
       found[a.p] = { model: m, at: Date.now() };
       console.log(`[${a.p}] nouveau modèle trouvé: ${m}`);
-      if (left() > 1500) res = await callOne(a, msgs, Math.min(5500, left()), opts);
+      if (left() > 1500) res = await callOne(a, msgs, Math.min(ATTEMPT_MS(), left()), opts);
     }
   }
-  if (!res.ok && a.p === 'gemini' && res.status === 400 && !opts.noReasoning && left() > 1500) {
-    res = await callOne(a, msgs, Math.min(5500, left()), { ...opts, noReasoning: true });
+  if (!res.ok && res.status === 400 && !opts.noReasoning && (a.p === 'gemini' || /gpt-oss/i.test(modelFor(a.p))) && left() > 1500) {
+    res = await callOne(a, msgs, Math.min(ATTEMPT_MS(), left()), { ...opts, noReasoning: true });
   }
   return res;
 }
@@ -215,10 +226,10 @@ exports.handler = async (event) => {
     if (event.queryStringParameters && event.queryStringParameters.test) {
       if (Date.now() - lastTest < 30000) return json(429, { error: 'Attends 30 secondes entre deux tests.' });
       lastTest = Date.now();
-      const deadline = Date.now() + 9000;
+      const deadline = Date.now() + BUDGET_MS();
       const jobs = order().filter(p => keysFor(p).length).map(async (p) => {
-        const res = await smartCall({ p, k: keysFor(p)[0] }, [{ role: 'user', content: 'Dis seulement: ok' }], deadline, { noSystem: true, maxTokens: 30 });
-        return { fournisseur: p, ok: res.ok, statut: res.ok ? 200 : res.status, code: res.code || undefined, modele: modelFor(p) };
+        const res = await smartCall({ p, k: keysFor(p)[0] }, [{ role: 'user', content: 'Dis seulement: ok' }], deadline, { noSystem: true, maxTokens: 300 });
+        return { fournisseur: p, ok: res.ok, statut: res.ok ? 200 : res.status, code: res.code || undefined, ms: res.ms, modele: modelFor(p) };
       });
       base.test = await Promise.all(jobs);
     }
@@ -251,7 +262,7 @@ exports.handler = async (event) => {
     return json(500, { error: 'Aucune clé API configurée côté serveur (ex: GROQ_API_KEY ou GEMINI_API_KEY dans les variables Netlify/Render).' });
   }
 
-  const deadline = Date.now() + 9000; // Netlify coupe les fonctions gratuites vers 10 s
+  const deadline = Date.now() + BUDGET_MS(); // Netlify coupe les fonctions gratuites vers 10 s
   const notes = [];
   for (const a of attempts.slice(0, 5)) {
     if (deadline - Date.now() < 1500) break;
