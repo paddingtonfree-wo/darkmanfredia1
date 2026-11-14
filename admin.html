@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>Admin · Dark Manfred</title>
+<style>
+body{font:16px/1.5 system-ui,sans-serif;background:#f2efe9;color:#0c0c0f;margin:0;padding:24px;display:grid;place-items:start center}
+form{background:#fff;border:1.5px solid #0c0c0f;border-radius:14px;padding:20px;width:min(420px,100%);display:grid;gap:12px}
+h1{font-size:18px;margin:0}label{font-size:13px;color:#555;display:grid;gap:4px}
+input{font:inherit;padding:10px;border:1px solid #ccc;border-radius:8px}
+button{font:inherit;background:#0c0c0f;color:#fff;border:0;border-radius:8px;padding:12px;cursor:pointer}
+button:hover{background:#b0102a}#out{font-size:14px;min-height:1.4em}
+</style></head><body>
+<form id="f">
+  <h1>Activer un abonnement</h1>
+  <label>Clé admin<input id="key" type="password" autocomplete="off" required></label>
+  <label>Code de l'utilisateur (ex : 7k3f9q2x1a)<input id="code" required autocapitalize="off" autocomplete="off"></label>
+  <label>Nombre de jours (0 = retirer)<input id="days" type="number" min="0" max="365" value="30" required></label>
+  <button>Valider</button>
+  <div id="out"></div>
+</form>
+<script>
+document.getElementById('f').onsubmit = async e => {
+  e.preventDefault();
+  const out = document.getElementById('out'); out.textContent = '…';
+  try {
+    const r = await fetch('/api/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: key.value, code: code.value, days: days.value }) });
+    const d = await r.json();
+    out.textContent = d.message || d.error || 'Erreur';
+  } catch (err) { out.textContent = 'Erreur réseau.'; }
+};
+</script></body></html>
